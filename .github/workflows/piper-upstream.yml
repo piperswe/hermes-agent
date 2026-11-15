@@ -1,0 +1,59 @@
+name: Piper stable upstream merge proposals
+on:
+  schedule:
+    - cron: '17 15 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  propose:
+    if: github.repository == 'piperswe/hermes-agent'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: piperswe/hermes-agent
+      BASE: baseline-v0.23.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: baseline-v0.23.1
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Propose exact final release merge; never promote
+        run: |
+          set -euo pipefail
+          TAG=$(python3 operations/releases.py)
+          [ -n "$TAG" ] || exit 0
+          BRANCH="upstream-release/$TAG"
+          if [ "$(gh pr list --head "$BRANCH" --base "$BASE" --state all --json number --jq length)" != 0 ]; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          gh auth setup-git
+          git fetch --no-tags https://github.com/NousResearch/hermes-agent.git "refs/tags/$TAG"
+          TAG_OBJECT=$(git rev-parse FETCH_HEAD)
+          SHA=$(git rev-parse 'FETCH_HEAD^{commit}')
+          git merge-base --is-ancestor "$SHA" HEAD && exit 0
+          git switch -c "$BRANCH"
+          # Never run inherited upstream release/publish workflows on this fork.
+          cp -a .github/workflows "$RUNNER_TEMP/piper-workflows"
+          if ! git merge --no-ff --no-commit "$SHA"; then
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts"
+            if grep -Ev '^\.github/workflows/' "$RUNNER_TEMP/conflicts"; then
+              echo '::error::Non-workflow merge conflicts require a manual exact-tag merge proposal.'
+              git merge --abort
+              exit 1
+            fi
+          fi
+          git rm -rf --ignore-unmatch .github/workflows
+          mkdir -p .github/workflows
+          cp -a "$RUNNER_TEMP/piper-workflows/." .github/workflows/
+          git add .github/workflows
+          git commit -m "Merge upstream $TAG ($SHA) for review only"
+          git push origin "HEAD:refs/heads/$BRANCH"
+          printf 'Exact upstream release: %s\nTag object: %s\nPeeled commit: %s\n\nReview only. No auto-merge, image promotion, pin change, or live deployment. Baseline builds remain v0.23.1; packaging-only guard intentionally fails for newer source until the independent upgrade plan is approved. Review dependency/schema/plugin compatibility and backup/restore before updating the build pin. GITHUB_TOKEN-created PRs may need a manually dispatched CI run.\n' "$TAG" "$TAG_OBJECT" "$SHA" > "$RUNNER_TEMP/body"
+          gh pr create --head "$BRANCH" --base "$BASE" --draft --title "Review upstream $TAG" --body-file "$RUNNER_TEMP/body"
+          gh pr view "$BRANCH" --json url,state,headRefOid

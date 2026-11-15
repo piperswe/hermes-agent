@@ -1,0 +1,116 @@
+name: Piper unmodified baseline
+on:
+  pull_request:
+    branches: [baseline-v0.23.1]
+  push:
+    branches: [ci/unmodified-v0.23.1, baseline-v0.23.1]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: baseline-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  upstream-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      HERMES_TEST_WORKERS: '2'
+      HERMES_TEST_FILE_RETRIES: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-pm
+        with:
+          extras: '["all", "anthropic"]'
+          test-environment: 'true'
+      - name: Upstream state retention and package identity regressions
+        run: scripts/run_tests.sh tests/hermes_state/ tests/scripts/test_write_install_stamp.py tests/scripts/test_install_stamp_distance.py
+  build-test-publish:
+    needs: upstream-tests
+    if: github.repository == 'piperswe/hermes-agent'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    env:
+      UPSTREAM_SHA: 3b421578588243f920886e6fe79a6faa87ea026e
+      IMAGE: ghcr.io/piperswe/hermes-agent
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify packaging-only fork and unit tests
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s operations -v
+          git diff --name-only "$UPSTREAM_SHA" HEAD > changed.txt
+          if grep -Ev '^(\.github/workflows/|operations/|deploy/)' changed.txt; then
+            echo 'Application source differs from the approved baseline'; exit 1
+          fi
+          mkdir source dist
+          git archive "$UPSTREAM_SHA" | tar -x -C source
+          git fetch --no-tags https://github.com/NousResearch/hermes-agent.git refs/tags/v0.23.1
+          test "$(git rev-parse FETCH_HEAD)" = b65acf3fdc1d43bd889211ea8e37032974b395a5
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$UPSTREAM_SHA"
+          COMMIT_DATE=$(git show -s --format=%ct "$UPSTREAM_SHA")
+          cd source
+          python3 scripts/write_install_stamp.py --output install-stamp.json --commit "$UPSTREAM_SHA" --commit-date "$COMMIT_DATE" --branch v0.23.1 --base-version 0.23.1 --distance 0 --source ci --distribution docker --update-mechanism external
+      - name: Render and schema-validate manifests offline
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz -o "$RUNNER_TEMP/kubeconform.tar.gz"
+          printf '%s  %s\n' 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883 "$RUNNER_TEMP/kubeconform.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/kubeconform.tar.gz" -C "$RUNNER_TEMP" kubeconform
+          kubectl kustomize deploy/overlays/flux-app > dist/rendered.yaml
+          "$RUNNER_TEMP/kubeconform" -strict -summary -schema-location 'https://raw.githubusercontent.com/yannh/kubernetes-json-schema/6ea44f54bb5cdedb2f61fba42c9b342e97959262/master-standalone-strict/{{.ResourceKind}}.json' -schema-location 'deploy/schemas/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' dist/rendered.yaml
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build official complete Docker recipe
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: source
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ env.IMAGE }}:v0.23.1-${{ github.sha }}-${{ github.run_id }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/piperswe/hermes-agent
+            org.opencontainers.image.revision=${{ env.UPSTREAM_SHA }}
+            org.opencontainers.image.version=0.23.1
+            me.piperswe.packaging.revision=${{ github.sha }}
+            me.piperswe.packaging.run=${{ github.run_id }}
+          cache-from: type=gha,scope=piper-v0231
+          cache-to: type=gha,scope=piper-v0231,mode=max
+      - name: Test image without production state or credentials
+        env:
+          TAG: ${{ env.IMAGE }}:v0.23.1-${{ github.sha }}-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --entrypoint /opt/hermes/.venv/bin/python "$TAG" -c 'import json,sqlite3,pathlib; p=pathlib.Path("/opt/hermes"); s=json.loads((p/"install-stamp.json").read_text()); assert s["commit"]=="3b421578588243f920886e6fe79a6faa87ea026e",s; assert sqlite3.sqlite_version_info >= (3,51,3); assert (p/"hermes_cli/web_dist/index.html").is_file(); assert (p/"apps/desktop/dist-webapp/index.html").is_file(); assert (p/"ui-tui/dist/entry.js").is_file(); print("Pinned source, SQLite, dashboard, webapp, TUI: PASS")'
+          docker run --rm --network none "$TAG" --version | tee dist/version.txt
+          python3 operations/baseline.py deploy/overlays/flux-app/app.yaml "sha256:$(printf '%064d' 0)" dist/render-check.yaml
+          docker image inspect "$TAG" > dist/image-inspect.json
+      - name: Publish tested image only; never deploy
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ env.IMAGE }}:v0.23.1-${{ github.sha }}-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          trap 'docker logout ghcr.io >/dev/null' EXIT
+          docker push "$TAG" | tee dist/push.txt
+          DIGEST=$(docker image inspect "$TAG" --format '{{index .RepoDigests 0}}' | cut -d@ -f2)
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker buildx imagetools inspect "$IMAGE@$DIGEST" | tee dist/registry-inspect.txt
+          python3 operations/baseline.py deploy/overlays/flux-app/app.yaml "$DIGEST" dist/app.yaml
+          printf '{"upstreamTag":"v0.23.1","upstreamCommit":"%s","packagingCommit":"%s","image":"%s@%s","run":"%s/%s/actions/runs/%s"}\n' "$UPSTREAM_SHA" "$GITHUB_SHA" "$IMAGE" "$DIGEST" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > dist/receipt.json
+          cat dist/receipt.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: baseline-${{ github.run_id }}
+          path: dist/
+          retention-days: 90
