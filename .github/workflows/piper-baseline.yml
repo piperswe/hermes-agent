@@ -36,7 +36,9 @@ jobs:
           fi
           mkdir source dist
           git archive "$UPSTREAM_SHA" | tar -x -C source
-          test "$(git rev-parse refs/tags/v0.23.1^{commit})" = "$UPSTREAM_SHA"
+          git fetch --no-tags https://github.com/NousResearch/hermes-agent.git refs/tags/v0.23.1
+          test "$(git rev-parse FETCH_HEAD)" = b65acf3fdc1d43bd889211ea8e37032974b395a5
+          test "$(git rev-parse FETCH_HEAD^{commit})" = "$UPSTREAM_SHA"
           cd source
           python3 scripts/write_install_stamp.py --output install-stamp.json --commit "$UPSTREAM_SHA" --branch v0.23.1 --base-version 0.23.1 --distance 0 --source ci --distribution docker --update-mechanism external
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
