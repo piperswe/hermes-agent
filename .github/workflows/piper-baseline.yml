@@ -11,7 +11,24 @@ concurrency:
   group: baseline-${{ github.ref }}
   cancel-in-progress: false
 jobs:
+  upstream-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      HERMES_TEST_WORKERS: '2'
+      HERMES_TEST_FILE_RETRIES: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-pm
+        with:
+          extras: '["all", "anthropic"]'
+          test-environment: 'true'
+      - name: Upstream state retention and package identity regressions
+        run: scripts/run_tests.sh tests/hermes_state/ tests/scripts/test_write_install_stamp.py tests/scripts/test_install_stamp_distance.py
   build-test-publish:
+    needs: upstream-tests
     if: github.repository == 'piperswe/hermes-agent'
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -38,9 +55,18 @@ jobs:
           git archive "$UPSTREAM_SHA" | tar -x -C source
           git fetch --no-tags https://github.com/NousResearch/hermes-agent.git refs/tags/v0.23.1
           test "$(git rev-parse FETCH_HEAD)" = b65acf3fdc1d43bd889211ea8e37032974b395a5
-          test "$(git rev-parse FETCH_HEAD^{commit})" = "$UPSTREAM_SHA"
+          test "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$UPSTREAM_SHA"
+          COMMIT_DATE=$(git show -s --format=%ct "$UPSTREAM_SHA")
           cd source
-          python3 scripts/write_install_stamp.py --output install-stamp.json --commit "$UPSTREAM_SHA" --branch v0.23.1 --base-version 0.23.1 --distance 0 --source ci --distribution docker --update-mechanism external
+          python3 scripts/write_install_stamp.py --output install-stamp.json --commit "$UPSTREAM_SHA" --commit-date "$COMMIT_DATE" --branch v0.23.1 --base-version 0.23.1 --distance 0 --source ci --distribution docker --update-mechanism external
+      - name: Render and schema-validate manifests offline
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 https://github.com/yannh/kubeconform/releases/download/v0.8.0/kubeconform-linux-amd64.tar.gz -o "$RUNNER_TEMP/kubeconform.tar.gz"
+          printf '%s  %s\n' 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883 "$RUNNER_TEMP/kubeconform.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/kubeconform.tar.gz" -C "$RUNNER_TEMP" kubeconform
+          kubectl kustomize deploy/overlays/flux-app > dist/rendered.yaml
+          "$RUNNER_TEMP/kubeconform" -strict -summary -schema-location 'https://raw.githubusercontent.com/yannh/kubernetes-json-schema/6ea44f54bb5cdedb2f61fba42c9b342e97959262/master-standalone-strict/{{.ResourceKind}}.json' -schema-location 'deploy/schemas/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' dist/rendered.yaml
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build official complete Docker recipe
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
