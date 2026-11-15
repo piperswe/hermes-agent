@@ -1,0 +1,583 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    configmap.reloader.stakater.com/reload: internal-trust,outbound-trust
+    secret.reloader.stakater.com/auto: "true"
+  name: hermes
+  namespace: hermes
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hermes
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      annotations:
+        checksum/config: 6be7d1bf7cf71d134d720a6a8cf035547b3dafffabb3c3977a58bf3d1bd904d4
+      labels:
+        app.kubernetes.io/name: hermes
+    spec:
+      automountServiceAccountToken: false
+      containers:
+        - args:
+            - gateway
+            - run
+          env:
+            - name: HERMES_UID
+              value: "10000"
+            - name: HERMES_GID
+              value: "10000"
+            - name: DOCKER_HOST
+              value: unix:///run/hermes-docker/docker.sock
+            - name: SSL_CERT_FILE
+              value: /etc/honcho-trust/ca.crt
+            - name: API_SERVER_ENABLED
+              value: "true"
+            - name: API_SERVER_HOST
+              value: 127.0.0.1
+            - name: API_SERVER_KEY
+              valueFrom:
+                secretKeyRef:
+                  key: key
+                  name: hermes-health-api
+          image: nousresearch/hermes-agent@sha256:276d44685c65c0cb2a25f190b63c65c8906f9dc76486fb1c05ae71b5826bda08
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8642/health', timeout=3).read()
+            failureThreshold: 6
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+          name: hermes
+          readinessProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8642/health', timeout=3).read()
+            failureThreshold: 3
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+          resources:
+            limits:
+              memory: 4Gi
+            requests:
+              cpu: 250m
+              memory: 4Gi
+          startupProbe:
+            exec:
+              command:
+                - python3
+                - -c
+                - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8642/health', timeout=3).read()
+            failureThreshold: 90
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /run/hermes-docker
+              name: docker-socket
+            - mountPath: /usr/local/bin/docker
+              name: docker-cli
+              readOnly: true
+              subPath: docker
+            - mountPath: /usr/local/libexec/docker/cli-plugins
+              name: docker-cli
+              readOnly: true
+              subPath: cli-plugins
+            - mountPath: /opt/data
+              name: data
+            - mountPath: /etc/honcho-trust
+              name: honcho-trust
+              readOnly: true
+          workingDir: /opt/data/workspace
+        - image: nginx:1.30.6-alpine
+          imagePullPolicy: IfNotPresent
+          name: nginx
+          ports:
+            - containerPort: 8443
+              name: https
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+                - wget
+                - -q
+                - -O
+                - /dev/null
+                - http://127.0.0.1:8081/healthz
+            failureThreshold: 3
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 1
+          resources:
+            limits:
+              memory: 64Mi
+            requests:
+              cpu: 10m
+              memory: 16Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /etc/nginx/nginx.conf
+              name: config
+              readOnly: true
+              subPath: nginx.conf
+            - mountPath: /etc/service-tls
+              name: service-tls
+              readOnly: true
+            - mountPath: /etc/service-trust
+              name: service-trust
+              readOnly: true
+      dnsPolicy: ClusterFirst
+      initContainers:
+        - args:
+            - mkdir -p /opt/data/workspace; if [ ! -e /opt/data/config.yaml ]; then cp /seed/config.yaml /opt/data/config.yaml; chmod 640 /opt/data/config.yaml; fi; chown 10000:10000 /opt/data /opt/data/workspace /opt/data/config.yaml
+          command:
+            - sh
+            - -ec
+          image: busybox:1.37.0
+          imagePullPolicy: IfNotPresent
+          name: seed-data
+          resources:
+            limits:
+              memory: 64Mi
+            requests:
+              cpu: 10m
+              memory: 16Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /opt/data
+              name: data
+            - mountPath: /seed
+              name: config
+              readOnly: true
+        - args:
+            - if [ ! -e /opt/data/config.before-honcho.yaml ]; then cp -p /opt/data/config.yaml /opt/data/config.before-honcho.yaml; chmod 600 /opt/data/config.before-honcho.yaml; fi; /command/s6-setuidgid hermes /opt/hermes/.venv/bin/python /seed/configure_honcho.py; if [ ! -f /opt/data/.honcho-plugin-70c67624169683b9e265517aec95a51b8077cabc ] || [ ! -f /opt/data/plugins/honcho/plugin.yaml ]; then hermes plugins install honcho --ref 70c67624169683b9e265517aec95a51b8077cabc --enable --yes-deps; /command/s6-setuidgid hermes touch /opt/data/.honcho-plugin-70c67624169683b9e265517aec95a51b8077cabc; fi; /command/s6-setuidgid hermes /opt/hermes/.venv/bin/python /seed/configure_honcho.py restore-config
+          command:
+            - sh
+            - -ec
+          env:
+            - name: HOME
+              value: /opt/data
+            - name: HERMES_HOME
+              value: /opt/data
+          image: nousresearch/hermes-agent@sha256:276d44685c65c0cb2a25f190b63c65c8906f9dc76486fb1c05ae71b5826bda08
+          imagePullPolicy: IfNotPresent
+          name: configure-honcho
+          resources:
+            limits:
+              memory: 1Gi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /opt/data
+              name: data
+            - mountPath: /seed
+              name: config
+              readOnly: true
+            - mountPath: /honcho-credentials
+              name: honcho-credentials
+              readOnly: true
+        - args:
+            - cp /usr/local/bin/docker /client/docker; mkdir -p /client/cli-plugins; cp /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-compose /client/cli-plugins/
+          command:
+            - sh
+            - -ec
+          image: docker:29.9.3-dind@sha256:7bf70dcb85c822e3fa6f2d332143e474b99147b9d7b39102b0cfe8b04a7dd61b
+          imagePullPolicy: IfNotPresent
+          name: install-docker-cli
+          resources:
+            limits:
+              memory: 128Mi
+            requests:
+              cpu: 10m
+              memory: 16Mi
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /client
+              name: docker-cli
+        - args:
+            - dockerd
+            - --host=unix:///run/hermes-docker/docker.sock
+            - --group=10000
+          image: docker:29.9.3-dind@sha256:7bf70dcb85c822e3fa6f2d332143e474b99147b9d7b39102b0cfe8b04a7dd61b
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            exec:
+              command:
+                - docker
+                - --host=unix:///run/hermes-docker/docker.sock
+                - info
+            failureThreshold: 6
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+          name: dind
+          readinessProbe:
+            exec:
+              command:
+                - docker
+                - --host=unix:///run/hermes-docker/docker.sock
+                - info
+            failureThreshold: 3
+            periodSeconds: 10
+            successThreshold: 1
+            timeoutSeconds: 5
+          resources:
+            limits:
+              ephemeral-storage: 12Gi
+              memory: 2Gi
+            requests:
+              cpu: 250m
+              ephemeral-storage: 1Gi
+              memory: 256Mi
+          restartPolicy: Always
+          securityContext:
+            privileged: true
+          startupProbe:
+            exec:
+              command:
+                - docker
+                - --host=unix:///run/hermes-docker/docker.sock
+                - info
+            failureThreshold: 60
+            periodSeconds: 2
+            successThreshold: 1
+            timeoutSeconds: 5
+          terminationMessagePath: /dev/termination-log
+          terminationMessagePolicy: File
+          volumeMounts:
+            - mountPath: /run/hermes-docker
+              name: docker-socket
+            - mountPath: /var/lib/docker
+              name: docker-data
+            - mountPath: /opt/data/workspace
+              name: data
+              subPath: workspace
+      nodeSelector:
+        pool: a1
+      restartPolicy: Always
+      schedulerName: default-scheduler
+      securityContext: {}
+      terminationGracePeriodSeconds: 60
+      volumes:
+        - emptyDir: {}
+          name: docker-socket
+        - emptyDir:
+            sizeLimit: 256Mi
+          name: docker-cli
+        - emptyDir:
+            sizeLimit: 10Gi
+          name: docker-data
+        - name: data
+          persistentVolumeClaim:
+            claimName: hermes-data
+        - configMap:
+            defaultMode: 420
+            name: hermes-config
+          name: config
+        - name: service-tls
+          secret:
+            defaultMode: 420
+            secretName: hermes-tls
+        - configMap:
+            defaultMode: 420
+            name: internal-trust
+          name: service-trust
+        - configMap:
+            defaultMode: 420
+            name: outbound-trust
+          name: honcho-trust
+        - name: honcho-credentials
+          secret:
+            defaultMode: 420
+            secretName: hermes-honcho
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hermes
+  namespace: hermes
+spec:
+  ports:
+    - name: https
+      port: 443
+      protocol: TCP
+      targetPort: https
+  selector:
+    app.kubernetes.io/name: hermes
+  sessionAffinity: None
+  type: ClusterIP
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: hermes-http
+  namespace: hermes
+spec:
+  hostnames:
+    - hermes.piperswe.me
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: shared
+      namespace: eg
+      sectionName: http
+  rules:
+    - filters:
+        - requestRedirect:
+            scheme: https
+            statusCode: 301
+          type: RequestRedirect
+      matches:
+        - path:
+            type: PathPrefix
+            value: /
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: hermes-https
+  namespace: hermes
+spec:
+  hostnames:
+    - hermes.piperswe.me
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: shared
+      namespace: eg
+      sectionName: https
+  rules:
+    - backendRefs:
+        - group: ""
+          kind: Service
+          name: hermes
+          port: 443
+          weight: 1
+      matches:
+        - path:
+            type: PathPrefix
+            value: /
+      timeouts:
+        request: 3600s
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hermes-ingress
+  namespace: hermes
+spec:
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: eg
+      ports:
+        - port: 8443
+          protocol: TCP
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: hermes
+  policyTypes:
+    - Ingress
+
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: hermes-backend-tls
+  namespace: hermes
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: hermes
+  validation:
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: internal-trust
+    hostname: hermes.hermes.svc.cluster.local
+
+---
+apiVersion: v1
+data:
+  config.yaml: |
+    model:
+      provider: openrouter
+      default: deepseek/deepseek-v4.1-flash-1017
+      base_url: ''
+      api_mode: chat_completions
+    terminal:
+      backend: local
+      cwd: /opt/data/workspace
+    webapp:
+      enabled: false
+      host: 0.0.0.0
+      port: 9120
+    dashboard:
+      trusted_proxies:
+        - 127.0.0.1
+  configure_honcho.py: |
+    """Merge the managed Honcho connection into a persistent Hermes home."""
+
+    import json
+    import os
+    import shutil
+    import sys
+    from importlib import import_module
+    from io import StringIO
+    from pathlib import Path
+
+
+    def configure(home: Path, token: str):
+        path = home / "honcho.json"
+        original = path.read_text() if path.exists() else None
+        config = json.loads(original) if original is not None else {}
+        hosts = config.setdefault("hosts", {})
+        host = hosts.setdefault("hermes", {})
+        host.update(
+            {
+                "enabled": True,
+                "baseUrl": "https://honcho.hermes.svc.cluster.local:8000",
+                "apiKey": token,
+                "workspace": "hermes",
+                "peerName": "pmc",
+                "aiPeer": "hermes",
+                "pinUserPeer": True,
+            }
+        )
+        for key, value in {
+            "recallMode": "hybrid",
+            "writeFrequency": "async",
+            "contextCadence": 1,
+            "dialecticCadence": 2,
+            "dialecticDepth": 1,
+            "sessionStrategy": "per-session",
+            "timeout": 20,
+        }.items():
+            host.setdefault(key, value)
+        result = json.dumps(config, indent=2) + "\n"
+        if original == result:
+            return
+        backup = home / "honcho.before-managed.json"
+        if original is not None and not backup.exists():
+            with open(backup, "x", opener=lambda p, flags: os.open(p, flags, 0o600)) as f:
+                f.write(original)
+        temporary = path.with_suffix(".json.tmp")
+        with open(temporary, "w", opener=lambda p, flags: os.open(p, flags, 0o600)) as f:
+            f.write(result)
+        temporary.chmod(0o600)
+        temporary.replace(path)
+
+
+    def restore_configuration(home: Path, snapshot: Path):
+        """Keep every pre-install setting; select only the managed memory provider.
+
+        The official image bundles ruamel.yaml. The Hermes CLI's config writer
+        normalizes unrelated auxiliary-model choices, so do not use it here.
+        """
+        yaml = import_module("ruamel.yaml").YAML()
+        yaml.preserve_quotes = True
+        config = yaml.load(snapshot.read_text())
+        if not isinstance(config, dict):
+            raise TypeError("Hermes configuration must be a mapping")
+        memory = config.setdefault("memory", {})
+        if not isinstance(memory, dict):
+            raise TypeError("Hermes memory configuration must be a mapping")
+        memory["provider"] = "honcho"
+        stream = StringIO()
+        yaml.dump(config, stream)
+        path = home / "config.yaml"
+        if path.read_text() == stream.getvalue():
+            return
+        temporary = home / ".config-honcho.tmp"
+        with open(temporary, "w", opener=lambda p, flags: os.open(p, flags, 0o600)) as f:
+            f.write(stream.getvalue())
+        temporary.chmod(path.stat().st_mode & 0o777)
+        temporary.replace(path)
+
+
+    if __name__ == "__main__":
+        home = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+        snapshot = home / ".config-before-honcho-bootstrap.yaml"
+        if len(sys.argv) > 1 and sys.argv[1] == "restore-config":
+            restore_configuration(home, Path(sys.argv[2]) if len(sys.argv) > 2 else snapshot)
+        else:
+            shutil.copy2(home / "config.yaml", snapshot)
+            configure(home, Path("/honcho-credentials/token").read_text().strip())
+  nginx.conf: |
+    user nginx;
+    worker_processes auto;
+    error_log /var/log/nginx/error.log notice;
+    pid /var/run/nginx.pid;
+    events { worker_connections 1024; }
+    http {
+        include /etc/nginx/mime.types;
+        access_log /var/log/nginx/access.log;
+        map $http_upgrade $connection_upgrade {
+            default upgrade;
+            '' close;
+        }
+        server {
+            listen 127.0.0.1:8081;
+            location = /healthz { access_log off; return 200 'ok'; }
+        }
+        server {
+            listen 8443 ssl;
+            server_name hermes.piperswe.me;
+            ssl_certificate /etc/service-tls/tls.crt;
+            ssl_certificate_key /etc/service-tls/tls.key;
+            ssl_client_certificate /etc/service-trust/ca.crt;
+            ssl_verify_client on;
+            ssl_protocols TLSv1.2 TLSv1.3;
+            client_max_body_size 50m;
+            location / {
+                proxy_pass http://127.0.0.1:9120;
+                proxy_http_version 1.1;
+                proxy_set_header Host hermes.piperswe.me;
+                proxy_set_header X-Forwarded-Host hermes.piperswe.me;
+                proxy_set_header X-Forwarded-Proto https;
+                proxy_set_header X-Forwarded-For $remote_addr;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection $connection_upgrade;
+                proxy_buffering off;
+                proxy_read_timeout 3600s;
+                proxy_send_timeout 3600s;
+                proxy_intercept_errors on;
+                error_page 502 504 =503 /setup-required;
+            }
+            location = /setup-required {
+                internal;
+                default_type text/plain;
+                return 503 'Hermes browser authentication is not configured or the service is starting. Contact the operator.\n';
+            }
+        }
+    }
+kind: ConfigMap
+metadata:
+  name: hermes-config
+  namespace: hermes
